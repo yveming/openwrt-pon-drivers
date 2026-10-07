@@ -123,6 +123,7 @@ struct en7572 {
 	bool prepared;
 	enum airoha_pon_frontend_mode prepared_mode;
 	bool tx_gate_enabled;
+	bool md32_running;
 };
 
 static u8 en7572_bob_u8(struct en7572 *en, unsigned int base,
@@ -662,6 +663,21 @@ static int en7572_prepare(struct airoha_pon_frontend *frontend,
 	en->prepared = false;
 	en->tx_gate_enabled = false;
 
+	/*
+	 * Reload the MD32 firmware on every line start. An image that kept
+	 * running since a previous session carries converged APC and burst
+	 * grading state, and upstream bursts then drift out of the OLT grant
+	 * window: the OLT registers the ONU, never serves it with grants, and
+	 * finally deregisters it. The firmware load that probe just completed
+	 * is the only exception.
+	 */
+	if (en->md32_running) {
+		ret = en7572_initialize_md32(en);
+		if (ret)
+			goto out_unlock;
+	}
+	en->md32_running = true;
+
 	ret = en7572_update_bits(en, EN7572_BEN_CTRL, EN7572_BEN_MODE_MASK,
 	                         EN7572_BEN_MODE_OFF);
 	if (ret)
@@ -981,6 +997,7 @@ static int en7572_probe(struct i2c_client *client)
 	if (ret)
 		return dev_err_probe(dev, ret,
 		                     "EN7572 MD32 initialization failed\n");
+	en->md32_running = true;
 
 	ret = en7572_read(en->runtime, EN7572_FW_VERSION_REG, &fw_version,
 	                  sizeof(fw_version));
