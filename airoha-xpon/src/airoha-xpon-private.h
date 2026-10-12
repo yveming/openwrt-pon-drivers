@@ -94,14 +94,39 @@ struct airoha_xpon_epon {
 	u32 last_register_status;
 };
 
-/* ONU states match hardware ACTIVATION_ST[3:0] values. */
+/*
+ * ONU states are the ITU-T G.987.3 activation states. The MAC reports six of
+ * them in ACTIVATION_ST[3:0] and merges Standby with Serial-Number into one
+ * value, so O2 and O3 are told apart by the SN-request/SN-sent interrupts and
+ * O6 has no register encoding at all. Values 1/2/4/5/7 are written to the
+ * register verbatim; see airoha_xpon_set_onu_state().
+ */
 enum airoha_xgpon_onu_state {
 	AIROHA_XGPON_O1 = 1,
-	AIROHA_XGPON_O2_3 = 2,
+	AIROHA_XGPON_O2 = 2,
+	AIROHA_XGPON_O3 = 3,
 	AIROHA_XGPON_O4 = 4,
 	AIROHA_XGPON_O5 = 5,
+	AIROHA_XGPON_O6 = 6,
 	AIROHA_XGPON_O7 = 7,
 };
+
+/*
+ * O2 Standby and O3 Serial-Number share ACTIVATION_ST value 2: downstream is
+ * synchronized and no ONU-ID has been assigned yet.
+ */
+static inline bool
+airoha_xgpon_state_is_serial_number(enum airoha_xgpon_onu_state state)
+{
+	return state == AIROHA_XGPON_O2 || state == AIROHA_XGPON_O3;
+}
+
+/* O4/O5 hold an ONU-ID, which is what makes a downstream loss a POPUP. */
+static inline bool
+airoha_xgpon_state_holds_onu_id(enum airoha_xgpon_onu_state state)
+{
+	return state == AIROHA_XGPON_O4 || state == AIROHA_XGPON_O5;
+}
 
 #define AIROHA_XGPON_BROADCAST_ID 0x03ff
 /* 0x3fe is the global destination accepted by the Deactivate handler. */
@@ -260,7 +285,20 @@ struct airoha_xpon {
 	atomic_t tx_resync_pending;
 	/* Assign_Alloc-ID queues deferred data paths for link_work. */
 	atomic_t data_path_retry_pending;
+	/* IRQ queues the SN exchange; link_work moves O2 to O3. */
+	atomic_t sn_exchange_pending;
+	/* Disable_Serial_Number queues the O7 stop and the way back to O1. */
+	atomic_t emergency_stop_pending;
+	atomic_t serial_enable_pending;
 	enum airoha_xgpon_onu_state onu_state;
+	/*
+	 * popup_pending latches O6 across the MAC epoch reset that follows a
+	 * downstream loss; popup_since expires it back to O1 after the TO2 window.
+	 */
+	bool popup_pending;
+	unsigned long popup_since;
+	/* upstream_disabled latches the emergency stop until the OLT enables us. */
+	bool upstream_disabled;
 	u16 onu_id;
 	u32 eqd;
 	bool optical_signal;
@@ -343,6 +381,9 @@ static inline u32 airoha_xpon_bytes_to_u32(const u8 *bytes)
 
 void airoha_xpon_set_onu_state(struct airoha_xpon *xpon,
                                enum airoha_xgpon_onu_state state);
+/* XG-PON only: POPUP is entered and expired under state_lock. */
+void airoha_xpon_enter_popup(struct airoha_xpon *xpon, const char *reason);
+void airoha_xpon_popup_timeout(struct airoha_xpon *xpon);
 void airoha_xpon_set_data_path_link(struct airoha_xpon *xpon, bool ready);
 void airoha_xpon_update_omci_link(struct airoha_xpon *xpon);
 const struct airoha_xpon_mode_info *
@@ -380,6 +421,7 @@ int airoha_xpon_replace_data_paths(
 int airoha_xpon_clear_data_path(struct airoha_xpon *xpon);
 void airoha_xpon_retry_data_paths(struct airoha_xpon *xpon);
 void airoha_xpon_clear_tconts(struct airoha_xpon *xpon);
+/* Caller holds state_lock; this function acquires ploam_lock. */
 unsigned int airoha_xpon_drain_ploamd(struct airoha_xpon *xpon);
 
 int airoha_xpon_crypto_init(struct airoha_xpon *xpon);

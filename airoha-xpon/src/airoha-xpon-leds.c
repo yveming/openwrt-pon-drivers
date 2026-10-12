@@ -148,8 +148,14 @@ void airoha_xpon_leds_update(struct airoha_xpon *xpon)
 		case AIROHA_XGPON_O4:
 			registration = AIROHA_XPON_LED_SLOW_BLINK;
 			break;
+		case AIROHA_XGPON_O7:
+			/* Emergency stop: upstream stays off until the OLT re-enables. */
+			registration = AIROHA_XPON_LED_OFF;
+			break;
 		case AIROHA_XGPON_O1:
-		case AIROHA_XGPON_O2_3:
+		case AIROHA_XGPON_O2:
+		case AIROHA_XGPON_O3:
+		case AIROHA_XGPON_O6:
 		default:
 			registration = AIROHA_XPON_LED_FAST_BLINK;
 			break;

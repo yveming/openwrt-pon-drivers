@@ -34,6 +34,9 @@ int airoha_xpon_try_arm_upstream(struct airoha_xpon *xpon)
 
 	if (READ_ONCE(xpon->tx_armed))
 		return 0;
+	/* O7 keeps the laser off until the OLT enables the serial number. */
+	if (READ_ONCE(xpon->upstream_disabled))
+		return 0;
 	if (READ_ONCE(xpon->stopping) || !xpon->optical_signal ||
 	    !xpon->mac_initialized ||
 	    !xpon->crypto.default_ploam_ik_programmed ||
@@ -41,7 +44,7 @@ int airoha_xpon_try_arm_upstream(struct airoha_xpon *xpon)
 	    !xpon->identity.active_identity.serial_configured ||
 	    !READ_ONCE(xpon->burst_profile_programmed))
 		return 0;
-	if (xpon->onu_state != AIROHA_XGPON_O2_3 &&
+	if (!airoha_xgpon_state_is_serial_number(xpon->onu_state) &&
 	    xpon->onu_state != AIROHA_XGPON_O4 &&
 	    xpon->onu_state != AIROHA_XGPON_O5)
 		return 0;
@@ -113,6 +116,7 @@ void airoha_xpon_clear_assignment(struct airoha_xpon *xpon)
 #define AIROHA_XGPON_PLOAMD_ASSIGN_ONU_ID        0x03
 #define AIROHA_XGPON_PLOAMD_RANGING_TIME         0x04
 #define AIROHA_XGPON_PLOAMD_DEACTIVATE           0x05
+#define AIROHA_XGPON_PLOAMD_DISABLE_SN           0x06
 #define AIROHA_XGPON_PLOAMD_REQUEST_REGISTRATION 0x09
 #define AIROHA_XGPON_PLOAMD_ASSIGN_ALLOC_ID      0x0a
 #define AIROHA_XGPON_PLOAMD_KEY_CONTROL          0x0d
@@ -124,6 +128,11 @@ void airoha_xpon_clear_assignment(struct airoha_xpon *xpon)
 #define AIROHA_XGPON_KEY_CONTROL_GENERATE        0
 #define AIROHA_XGPON_KEY_CONTROL_CONFIRM         1
 #define AIROHA_XGPON_DATA_KEY_BYTES              16
+
+/* Wire byte 5 of Disable_Serial_Number carries the Disable/Enable option. */
+#define AIROHA_XGPON_DISABLE_SN_DENY     0xff
+#define AIROHA_XGPON_DISABLE_SN_ENABLE   0x00
+#define AIROHA_XGPON_DISABLE_SN_REENABLE 0x0f
 
 static int airoha_xpon_wait_command(struct airoha_xpon *xpon, u32 reg,
                                     u32 done_mask)
@@ -573,7 +582,7 @@ static int airoha_xpon_program_profile(struct airoha_xpon *xpon,
 	pon_tag1 = airoha_xpon_bytes_to_u32(message + 25);
 	airoha_xgpon_write(xpon, AIROHA_XGPON_PON_TAG_0, pon_tag0);
 	airoha_xgpon_write(xpon, AIROHA_XGPON_PON_TAG_1, pon_tag1);
-	if (xpon->onu_state == AIROHA_XGPON_O2_3 &&
+	if (airoha_xgpon_state_is_serial_number(xpon->onu_state) &&
 	    (!xpon->crypto.activation_keys_programmed ||
 	     xpon->crypto.activation_pon_tag0 != pon_tag0 ||
 	     xpon->crypto.activation_pon_tag1 != pon_tag1)) {
@@ -892,7 +901,7 @@ static int airoha_xpon_accept_assign_onu_id(struct airoha_xpon *xpon,
 	if (xpon->onu_state == AIROHA_XGPON_O4 ||
 	    xpon->onu_state == AIROHA_XGPON_O5)
 		return xpon->onu_id == onu_id ? 0 : -EINVAL;
-	if (xpon->onu_state != AIROHA_XGPON_O2_3)
+	if (!airoha_xgpon_state_is_serial_number(xpon->onu_state))
 		return -EINVAL;
 
 	/* The unicast GEM follows publication of ONU_ID.valid. */
@@ -995,6 +1004,47 @@ static int airoha_xpon_accept_alloc_id(struct airoha_xpon *xpon,
 	return ret;
 }
 
+/*
+ * Disable_Serial_Number names the serial number it applies to and carries the
+ * Disable/Enable option in wire byte 5. Denying this ONU is the emergency stop
+ * (O7): the decision to close or reopen the upstream gate belongs to link_work,
+ * which owns the ONU state under state_lock, so only the request is queued here.
+ */
+static int airoha_xpon_accept_disable_serial_number(struct airoha_xpon *xpon,
+                                                    const u8 *message)
+{
+	u8 option = message[4];
+
+	if (memcmp(message + 5, xpon->identity.active_identity.serial_number,
+	           sizeof(xpon->identity.active_identity.serial_number))) {
+		dev_dbg(xpon->dev,
+		        "Disable_Serial_Number ignored: serial mismatch, option=0x%02x\n",
+		        option);
+		return -EADDRNOTAVAIL;
+	}
+
+	switch (option) {
+	case AIROHA_XGPON_DISABLE_SN_DENY:
+		atomic_set(&xpon->emergency_stop_pending, 1);
+		return 0;
+	case AIROHA_XGPON_DISABLE_SN_ENABLE:
+	case AIROHA_XGPON_DISABLE_SN_REENABLE:
+		atomic_set(&xpon->serial_enable_pending, 1);
+		return 0;
+	default:
+		/*
+		 * 0x3f and 0xf0 address groups of ONUs rather than this serial
+		 * number, and the remaining options are vendor extensions. None of
+		 * them may park a single ONU, so they are reported, not applied.
+		 */
+		dev_info_ratelimited(
+			xpon->dev,
+			"Disable_Serial_Number option 0x%02x is not applied to a single ONU\n",
+			option);
+		return -EOPNOTSUPP;
+	}
+}
+
 static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
                                      const u8 *message)
 {
@@ -1028,6 +1078,9 @@ static int airoha_xpon_handle_ploamd(struct airoha_xpon *xpon,
 		if (ret == -EACCES)
 			ret = 0;
 		break;
+	case AIROHA_XGPON_PLOAMD_DISABLE_SN:
+		ret = airoha_xpon_accept_disable_serial_number(xpon, message);
+		break;
 	case AIROHA_XGPON_PLOAMD_KEY_CONTROL:
 		ret = airoha_xpon_handle_key_control(xpon, message);
 		break;
@@ -1059,7 +1112,8 @@ unsigned int airoha_xpon_drain_ploamd(struct airoha_xpon *xpon)
 {
 	unsigned int count;
 
-	/* T-CONT/GEM share a command port with manual data-path updates. */
+	/* State changes and T-CONT/GEM commands follow state_lock -> ploam_lock. */
+	lockdep_assert_held(&xpon->state_lock);
 	mutex_lock(&xpon->ploam_lock);
 	for (count = 0; count < AIROHA_XGPON_PLOAMD_MAX_DRAIN; count++) {
 		u8 message[AIROHA_XGPON_PLOAMD_BYTES];
