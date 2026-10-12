@@ -237,6 +237,9 @@ static void airoha_xpon_controller_stop(void *priv)
 	atomic_set(&xpon->mac_restart_pending, 0);
 	atomic_set(&xpon->tx_resync_pending, 0);
 	atomic_set(&xpon->data_path_retry_pending, 0);
+	atomic_set(&xpon->sn_exchange_pending, 0);
+	atomic_set(&xpon->emergency_stop_pending, 0);
+	atomic_set(&xpon->serial_enable_pending, 0);
 	if (epon) {
 		WRITE_ONCE(xpon->tx_armed, false);
 		airoha_pon_frontend_set_tx_enable(xpon->frontend, false);
@@ -263,6 +266,16 @@ static void airoha_xpon_controller_stop(void *priv)
 	mutex_lock(&xpon->state_lock);
 	if (!epon)
 		airoha_xpon_disarm_upstream(xpon, "netdev-stop-final");
+	/*
+	 * Restarting the interface is the operator's way out of a POPUP or an
+	 * emergency stop. G.987.3 expects a denied serial number to survive a
+	 * power cycle, which would need a writable state this driver does not
+	 * have; the OLT still refuses the registration it denied.
+	 */
+	if (!epon) {
+		xpon->popup_pending = false;
+		xpon->upstream_disabled = false;
+	}
 	if (xpon->rx_active)
 		airoha_xpon_deactivate_rx_locked(xpon);
 	else if (!epon && xpon->mac_initialized)
@@ -347,6 +360,7 @@ static bool airoha_xpon_handle_optical_loss_locked(struct airoha_xpon *xpon,
 				xpon->dev,
 				"PON RX stopping: LOS IRQ, sampled signal=%u, PHY events=0x%08x\n",
 				xpon->optical_signal, phy_events);
+			airoha_xpon_enter_popup(xpon, "RX_LOS");
 			airoha_xpon_deactivate_rx_locked(xpon);
 		}
 		xpon->identity.active_identity =
@@ -368,6 +382,8 @@ static bool airoha_xpon_handle_optical_loss_locked(struct airoha_xpon *xpon,
 			xpon->dev,
 			"PON RX stopping: optical signal absent, PHY events=0x%08x\n",
 			phy_events);
+		if (!airoha_xpon_mode_is_epon(xpon->active_mode))
+			airoha_xpon_enter_popup(xpon, "optical signal absent");
 		airoha_xpon_deactivate_rx_locked(xpon);
 	}
 	/* Latch pending identity on optical loss for the next O1 activation. */
@@ -453,6 +469,18 @@ static void airoha_xpon_link_work(struct work_struct *work)
 			airoha_xpon_xgpon_restart_mac(xpon, "OLT Deactivate");
 		if (atomic_xchg(&xpon->data_path_retry_pending, 0))
 			airoha_xpon_retry_data_paths(xpon);
+		if (atomic_xchg(&xpon->sn_exchange_pending, 0))
+			airoha_xpon_xgpon_note_serial_number(xpon);
+		if (atomic_xchg(&xpon->emergency_stop_pending, 0))
+			airoha_xpon_xgpon_emergency_stop(
+				xpon, "Disable_Serial_Number disable");
+		if (atomic_xchg(&xpon->serial_enable_pending, 0))
+			airoha_xpon_xgpon_enable_serial_number(xpon);
+		/*
+		 * The POPUP window starts at the loss and expires by itself, no
+		 * matter which way the link comes back.
+		 */
+		airoha_xpon_popup_timeout(xpon);
 	}
 
 	if (airoha_xpon_handle_optical_loss_locked(xpon, phy_events, &delay))
@@ -591,6 +619,9 @@ static int airoha_xpon_probe(struct platform_device *pdev)
 	atomic_set(&xpon->mac_restart_pending, 0);
 	atomic_set(&xpon->tx_resync_pending, 0);
 	atomic_set(&xpon->data_path_retry_pending, 0);
+	atomic_set(&xpon->sn_exchange_pending, 0);
+	atomic_set(&xpon->emergency_stop_pending, 0);
+	atomic_set(&xpon->serial_enable_pending, 0);
 	atomic_set(&xpon->epon.discovery_gate_count, 0);
 	atomic_set(&xpon->epon.register_request_count, 0);
 	xpon->lifecycle = AIROHA_XPON_STOPPED;

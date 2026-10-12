@@ -42,12 +42,16 @@ airoha_xgpon_onu_state_name(enum airoha_xgpon_onu_state state)
 	switch (state) {
 	case AIROHA_XGPON_O1:
 		return "O1";
-	case AIROHA_XGPON_O2_3:
-		return "O2_3";
+	case AIROHA_XGPON_O2:
+		return "O2";
+	case AIROHA_XGPON_O3:
+		return "O3";
 	case AIROHA_XGPON_O4:
 		return "O4";
 	case AIROHA_XGPON_O5:
 		return "O5";
+	case AIROHA_XGPON_O6:
+		return "O6";
 	case AIROHA_XGPON_O7:
 		return "O7";
 	default:

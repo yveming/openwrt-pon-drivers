@@ -140,13 +140,139 @@ out_restore:
 void airoha_xpon_set_onu_state(struct airoha_xpon *xpon,
                                enum airoha_xgpon_onu_state state)
 {
-	/* ACTIVATION_ST commits the ONU-ID, EqD, and T-CONT settings together. */
+	u32 programmed;
+
+	/*
+	 * ACTIVATION_ST commits the ONU-ID, EqD, and T-CONT settings together.
+	 * The MAC knows five activation values; O2 and O3 share value 2, and O6
+	 * (POPUP) has no encoding at all because the MAC is already being reset
+	 * when it applies. Keep the register at the last hardware value in that
+	 * case instead of writing a state the MAC does not define.
+	 */
+	switch (state) {
+	case AIROHA_XGPON_O2:
+	case AIROHA_XGPON_O3:
+		/* The MAC's single activation value for both states. */
+		programmed = AIROHA_XGPON_O2;
+		break;
+	case AIROHA_XGPON_O6:
+		xpon->onu_state = state;
+		airoha_xpon_leds_update(xpon);
+		return;
+	default:
+		programmed = state;
+		break;
+	}
+
 	airoha_xgpon_update_bits(xpon, AIROHA_XGPON_ACTIVATION_ST,
 	                         AIROHA_XGPON_ACTIVATION_STATE_MASK,
 	                         FIELD_PREP(AIROHA_XGPON_ACTIVATION_STATE_MASK,
-	                                    state));
+	                                    programmed));
 	xpon->onu_state = state;
 	airoha_xpon_leds_update(xpon);
+}
+
+/*
+ * The MAC reports the SN exchange through the activation interrupts, not through
+ * ACTIVATION_ST: the OLT asking for the serial number is what moves the ONU from
+ * Standby (O2) to the Serial-Number state (O3). Assign_ONU-ID leaves O3 for O4.
+ */
+void airoha_xpon_xgpon_note_serial_number(struct airoha_xpon *xpon)
+{
+	lockdep_assert_held(&xpon->state_lock);
+
+	if (xpon->onu_state != AIROHA_XGPON_O2)
+		return;
+
+	airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O3);
+	dev_info(xpon->dev,
+	         "PLOAM: serial number requested; ONU in O3, awaiting Assign_ONU-ID\n");
+}
+
+/*
+ * A downstream loss while the OLT still has an ONU-ID assigned to this ONU is a
+ * POPUP (O6), not a fresh activation: the ONU stops transmitting and waits for
+ * the OLT to re-range it. The epoch reset that follows keeps reporting O6 until
+ * the ONU reaches Standby again, or until the TO2 window expires.
+ */
+void airoha_xpon_enter_popup(struct airoha_xpon *xpon, const char *reason)
+{
+	lockdep_assert_held(&xpon->state_lock);
+
+	if (!airoha_xgpon_state_holds_onu_id(xpon->onu_state))
+		return;
+	if (xpon->popup_pending)
+		return;
+
+	xpon->popup_pending = true;
+	xpon->popup_since = jiffies;
+	airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O6);
+	dev_info(xpon->dev,
+	         "ONU POPUP (O6): downstream lost (%s); upstream stays off until the OLT re-ranges\n",
+	         reason);
+}
+
+void airoha_xpon_popup_timeout(struct airoha_xpon *xpon)
+{
+	lockdep_assert_held(&xpon->state_lock);
+
+	if (!xpon->popup_pending)
+		return;
+	if (time_before(jiffies, xpon->popup_since +
+	                            msecs_to_jiffies(AIROHA_XPON_NO_SYNC_RECOVERY_MS)))
+		return;
+
+	/* TO2 expiry: the ONU gives up its identity and restarts from O1. */
+	xpon->popup_pending = false;
+	airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O1);
+	dev_info(xpon->dev,
+	         "ONU POPUP (O6) timed out after %u ms; back to O1\n",
+	         AIROHA_XPON_NO_SYNC_RECOVERY_MS);
+}
+
+/*
+ * Disable_Serial_Number with the "disable" option parks the ONU in the emergency
+ * stop state: the laser stays off and no upstream burst is armed until the OLT
+ * enables the serial number again. The MAC encodes O7 in ACTIVATION_ST.
+ */
+void airoha_xpon_xgpon_emergency_stop(struct airoha_xpon *xpon,
+                                      const char *reason)
+{
+	lockdep_assert_held(&xpon->state_lock);
+
+	xpon->upstream_disabled = true;
+	xpon->popup_pending = false;
+	airoha_xpon_disarm_upstream(xpon, reason);
+	airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O7);
+	dev_warn(xpon->dev,
+	         "ONU emergency stop (O7): %s; upstream disabled until Disable_Serial_Number enables the serial number\n",
+	         reason);
+}
+
+void airoha_xpon_xgpon_enable_serial_number(struct airoha_xpon *xpon)
+{
+	lockdep_assert_held(&xpon->state_lock);
+
+	if (!xpon->upstream_disabled)
+		return;
+
+	/* The enable option returns the ONU to Standby with a fresh epoch. */
+	xpon->upstream_disabled = false;
+	airoha_xpon_xgpon_restart_mac(xpon, "Disable_Serial_Number enable");
+	dev_info(xpon->dev,
+	         "ONU emergency stop released; restarting activation from standby\n");
+}
+
+/*
+ * O6 outlives the epoch reset that follows a downstream loss, so the teardown
+ * state depends on whether the ONU lost a line it had already registered on.
+ */
+static enum airoha_xgpon_onu_state
+airoha_xpon_teardown_state(const struct airoha_xpon *xpon)
+{
+	if (READ_ONCE(xpon->upstream_disabled))
+		return AIROHA_XGPON_O7;
+	return xpon->popup_pending ? AIROHA_XGPON_O6 : AIROHA_XGPON_O1;
 }
 
 void airoha_xpon_update_omci_link(struct airoha_xpon *xpon)
@@ -273,10 +399,14 @@ irqreturn_t airoha_xpon_xgpon_irq(struct airoha_xpon *xpon)
 	if (READ_ONCE(xpon->stopping))
 		return IRQ_HANDLED;
 
-	if (events & AIROHA_XGPON_INT_SN_REQUEST)
+	if (events & AIROHA_XGPON_INT_SN_REQUEST) {
 		xpon->stats.sn_request_count++;
-	if (events & AIROHA_XGPON_INT_SN_SENT)
+		atomic_set(&xpon->sn_exchange_pending, 1);
+	}
+	if (events & AIROHA_XGPON_INT_SN_SENT) {
 		xpon->stats.sn_sent_count++;
+		atomic_set(&xpon->sn_exchange_pending, 1);
+	}
 	if (events & AIROHA_XGPON_INT_RANGING_REQUEST) {
 		u32 key_index;
 
@@ -345,7 +475,8 @@ irqreturn_t airoha_xpon_xgpon_irq(struct airoha_xpon *xpon)
 		}
 	}
 	if (atomic_read(&xpon->mac_restart_pending) ||
-	    atomic_read(&xpon->data_path_retry_pending))
+	    atomic_read(&xpon->data_path_retry_pending) ||
+	    atomic_read(&xpon->sn_exchange_pending))
 		mod_delayed_work(system_wq, &xpon->link_work, 0);
 
 	return IRQ_HANDLED;
@@ -438,7 +569,7 @@ static int airoha_xpon_xgpon_start_control(struct airoha_xpon *xpon)
 	if (READ_ONCE(xpon->stopping))
 		return -ESHUTDOWN;
 
-	/* Release MAC reset after XGTC synchronization, before O2_3. */
+	/* Release MAC reset after XGTC synchronization, before O2. */
 	airoha_xgpon_write(xpon, AIROHA_XGPON_INT_ENABLE, 0);
 	airoha_xgpon_update_bits(xpon, AIROHA_XGPON_SW_RST,
 	                         AIROHA_XGPON_MAC_RESET_RELEASED,
@@ -474,7 +605,16 @@ static int airoha_xpon_xgpon_start_control(struct airoha_xpon *xpon)
 	xpon->crypto.key_exchange_error_count = 0;
 	airoha_xpon_clear_assignment(xpon);
 	airoha_xpon_clear_tconts(xpon);
-	airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O2_3);
+	/*
+	 * Synchronization is back, so the POPUP window is over; the SN exchange
+	 * itself starts in O2 and the SN-request interrupt moves the ONU to O3.
+	 * An emergency stop has no such way out: only the OLT releases it.
+	 */
+	xpon->popup_pending = false;
+	atomic_set(&xpon->sn_exchange_pending, 0);
+	airoha_xpon_set_onu_state(xpon, READ_ONCE(xpon->upstream_disabled) ?
+	                                         AIROHA_XGPON_O7 :
+	                                         AIROHA_XGPON_O2);
 
 	/* Clear bootloader state before enabling activation interrupts. */
 	airoha_xpon_drain_ploamd(xpon);
@@ -491,7 +631,7 @@ static int airoha_xpon_xgpon_start_control(struct airoha_xpon *xpon)
 
 	dev_info(
 		xpon->dev,
-		"XGTC in sync; MAC entered O2_3, SN=%s, BEN/upstream TX remains disabled\n",
+		"XGTC in sync; MAC entered O2, SN=%s, BEN/upstream TX remains disabled\n",
 		xpon->identity.active_identity.serial_configured ?
 			"configured" :
 			"missing");
@@ -643,7 +783,7 @@ void airoha_xpon_xgpon_stop_rx(struct airoha_xpon *xpon)
 	airoha_xgpon_update_bits(xpon, AIROHA_XGPON_SW_RST,
 	                         AIROHA_XGPON_MAC_RESET_RELEASED, 0);
 	airoha_xpon_clear_assignment(xpon);
-	xpon->onu_state = AIROHA_XGPON_O1;
+	airoha_xpon_set_onu_state(xpon, airoha_xpon_teardown_state(xpon));
 	xpon->mac_initialized = false;
 	xpon->crypto.default_ploam_ik_programmed = false;
 	xpon->crypto.activation_keys_programmed = false;
@@ -665,7 +805,7 @@ void airoha_xpon_xgpon_restart_mac(struct airoha_xpon *xpon, const char *reason)
 	airoha_xgpon_update_bits(xpon, AIROHA_XGPON_SW_RST,
 	                         AIROHA_XGPON_MAC_RESET_RELEASED, 0);
 	airoha_xpon_clear_assignment(xpon);
-	airoha_xpon_set_onu_state(xpon, AIROHA_XGPON_O1);
+	airoha_xpon_set_onu_state(xpon, airoha_xpon_teardown_state(xpon));
 	xpon->mac_initialized = false;
 	xpon->crypto.default_ploam_ik_programmed = false;
 	xpon->crypto.activation_keys_programmed = false;
@@ -770,6 +910,8 @@ static void airoha_xpon_xgpon_advance_xgtc(struct airoha_xpon *xpon,
 		dev_warn_ratelimited(
 			xpon->dev,
 			"XGTC sync lost; resetting MAC epoch while retaining PHY RX\n");
+		/* Losing the downstream from O4/O5 is the POPUP condition, not O1. */
+		airoha_xpon_enter_popup(xpon, "PHY LOF");
 		airoha_xpon_xgpon_restart_mac(xpon, "PHY LOF");
 		*delay = msecs_to_jiffies(AIROHA_XPON_LINK_POLL_MS);
 		return;
